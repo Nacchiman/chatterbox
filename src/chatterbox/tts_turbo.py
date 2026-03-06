@@ -2,8 +2,10 @@ import os
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Generator, Tuple
 
 import librosa
+import numpy as np
 import torch
 import perth
 import pyloudnorm as ln
@@ -22,6 +24,11 @@ from .models.t3.modules.t3_config import T3Config
 from .models.s3gen.const import S3GEN_SIL
 import logging
 logger = logging.getLogger(__name__)
+
+# Streaming constants
+_TOKENS_PER_SEC = 25  # S3 tokenizer: 25 tokens/sec
+_MEL_PER_TOKEN = 2    # token_mel_ratio in CausalMaskedDiffWithXvec
+_SAMPLES_PER_MEL = 480  # mel hop_size at 24kHz
 
 REPO_ID = "ResembleAI/chatterbox-turbo"
 
@@ -294,3 +301,174 @@ class ChatterboxTurboTTS:
         wav = wav.squeeze(0).detach().cpu().numpy()
         watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text,
+        repetition_penalty=1.2,
+        min_p=0.00,
+        top_p=0.95,
+        audio_prompt_path=None,
+        exaggeration=0.0,
+        cfg_weight=0.0,
+        temperature=0.8,
+        top_k=1000,
+        norm_loudness=True,
+        chunk_duration_sec=1.0,
+        crossfade_duration_sec=0.04,
+        mel_overlap=10,
+    ) -> Generator[Tuple[int, np.ndarray], None, None]:
+        """ストリーミング音声生成。チャンクごとに (sample_rate, wav_numpy) を yield する。
+
+        T3 のトークン生成を 1 トークンずつ受け取り、chunk_duration_sec 秒分蓄積するたびに
+        S3Gen (flow + HiFiGAN) で音声を増分デコードして yield する。
+
+        Args:
+            text: 合成テキスト
+            chunk_duration_sec: 1 チャンクあたりの目標秒数 (デフォルト 1.0)
+            crossfade_duration_sec: チャンク境界のクロスフェード秒数 (デフォルト 0.04 = 40ms)
+            mel_overlap: HiFiGAN の畳み込み受容野を補うための mel フレーム overlap 数 (デフォルト 10)
+            その他: generate() と同一パラメータ
+
+        Yields:
+            (sample_rate, wav_chunk): int と 1D numpy array のタプル。
+                ストリーミング中はウォーターマークなし。
+        """
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
+            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
+
+        # Streaming parameters
+        chunk_tokens = max(1, round(chunk_duration_sec * _TOKENS_PER_SEC))
+        crossfade_samples = int(crossfade_duration_sec * S3GEN_SR)
+
+        # Streaming state
+        accumulated_tokens = []      # list of (1,1) tensors
+        prev_mel_end = 0             # 前回 flow で確定した mel フレーム数
+        cache_source = None          # HiFiGAN f0 音源キャッシュ
+        prev_wav_tail = None         # crossfade 用の前チャンク末尾 wav (1D tensor)
+        is_first_chunk = True
+
+        def _decode_chunk(speech_tokens_1d: torch.Tensor, finalize: bool):
+            """累積トークンから新規 wav チャンクをデコードする内部関数。"""
+            nonlocal prev_mel_end, cache_source, prev_wav_tail, is_first_chunk
+
+            # OOV 除去 + 最終チャンク時にサイレンス追加
+            tokens_clean = speech_tokens_1d[speech_tokens_1d < 6561]
+            if finalize:
+                silence = torch.tensor([S3GEN_SIL, S3GEN_SIL, S3GEN_SIL], dtype=torch.long, device=self.device)
+                tokens_clean = torch.cat([tokens_clean, silence])
+
+            if tokens_clean.numel() == 0:
+                return None
+
+            tokens_2d = tokens_clean.unsqueeze(0)  # (1, T)
+
+            # 1. Flow: 累積全トークンで mel 生成
+            mel = self.s3gen.flow_inference_streaming(
+                speech_tokens=tokens_2d,
+                ref_dict=self.conds.gen,
+                finalize=finalize,
+                n_cfm_timesteps=2,
+            )
+            # mel shape: (1, 80, mel_len)
+            total_mel_len = mel.shape[2]
+
+            if total_mel_len <= prev_mel_end:
+                return None
+
+            # 2. 新規 mel 抽出 (+ overlap でコンテキスト確保)
+            if prev_mel_end == 0:
+                # 最初のチャンク: overlap なし
+                new_mel = mel
+                overlap_mel_frames = 0
+            else:
+                overlap_start = max(0, prev_mel_end - mel_overlap)
+                new_mel = mel[:, :, overlap_start:]
+                overlap_mel_frames = prev_mel_end - overlap_start
+
+            # 3. HiFiGAN: 新規 mel + overlap のみデコード
+            wav_chunk, source = self.s3gen.hift_inference_streaming(
+                speech_feat=new_mel,
+                cache_source=cache_source,
+            )
+            # wav_chunk shape: (1, wav_len)
+
+            # cache_source を更新: 次チャンクの先頭で f0 連続性を保証
+            overlap_source_samples = mel_overlap * _SAMPLES_PER_MEL
+            cache_source = source[:, :, -overlap_source_samples:] if source.shape[2] > overlap_source_samples else source
+
+            wav_1d = wav_chunk.squeeze(0).detach().cpu()  # (wav_len,)
+
+            # 最初のチャンクで trim_fade を適用 (リファレンスクリップの spillover 低減)
+            if is_first_chunk:
+                trim_fade = self.s3gen.trim_fade.cpu()
+                fade_len = min(len(trim_fade), wav_1d.shape[0])
+                wav_1d[:fade_len] *= trim_fade[:fade_len]
+                is_first_chunk = False
+
+            # 4. Crossfade
+            # overlap 区間は HiFiGAN にコンテキストを与えるためのもの。
+            # overlap の末尾と prev_wav_tail の末尾を crossfade し、
+            # overlap を除いた新規部分のみを出力する。
+            if prev_wav_tail is not None and overlap_mel_frames > 0:
+                overlap_wav_samples = overlap_mel_frames * _SAMPLES_PER_MEL
+                actual_overlap = min(overlap_wav_samples, wav_1d.shape[0])
+                xfade_len = min(crossfade_samples, actual_overlap, prev_wav_tail.shape[0])
+
+                if xfade_len > 0 and actual_overlap > 0:
+                    fade_out = torch.linspace(1.0, 0.0, xfade_len)
+                    fade_in = torch.linspace(0.0, 1.0, xfade_len)
+                    # overlap 区間の末尾 xfade_len サンプルと prev_wav_tail の末尾をブレンド
+                    blend_start = actual_overlap - xfade_len
+                    blended = (prev_wav_tail[-xfade_len:] * fade_out
+                               + wav_1d[blend_start:actual_overlap] * fade_in)
+                    # [crossfade 済み区間] + [新規コンテンツ]
+                    wav_1d = torch.cat([blended, wav_1d[actual_overlap:]])
+                else:
+                    # crossfade 不可能な場合、overlap 部分を単純にスキップ
+                    wav_1d = wav_1d[actual_overlap:]
+
+            # 次回の crossfade 用に末尾を保持
+            prev_wav_tail = (wav_1d[-crossfade_samples:].clone()
+                             if wav_1d.shape[0] > crossfade_samples
+                             else wav_1d.clone())
+
+            prev_mel_end = total_mel_len
+
+            return wav_1d.numpy()
+
+        # ---- メインループ: T3 からトークンを逐次受け取る ----
+        token_gen = self.t3.inference_turbo_stream(
+            t3_cond=self.conds.t3,
+            text_tokens=text_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
+        for token in token_gen:
+            accumulated_tokens.append(token)
+
+            if len(accumulated_tokens) % chunk_tokens == 0:
+                speech_tokens_1d = torch.cat(accumulated_tokens, dim=1).squeeze(0)
+                wav_np = _decode_chunk(speech_tokens_1d, finalize=False)
+                if wav_np is not None and len(wav_np) > 0:
+                    yield (self.sr, wav_np)
+
+        # ---- 最終チャンク: 残りトークンを finalize=True で処理 ----
+        if accumulated_tokens:
+            speech_tokens_1d = torch.cat(accumulated_tokens, dim=1).squeeze(0)
+            wav_np = _decode_chunk(speech_tokens_1d, finalize=True)
+            if wav_np is not None and len(wav_np) > 0:
+                yield (self.sr, wav_np)
