@@ -405,7 +405,12 @@ class ChatterboxTurboTTS:
 
             # cache_source を更新: 次チャンクの先頭で f0 連続性を保証
             overlap_source_samples = mel_overlap * _SAMPLES_PER_MEL
-            cache_source = source[:, :, -overlap_source_samples:] if source.shape[2] > overlap_source_samples else source
+            # mel_overlap=0 のとき overlap_source_samples=0 になり, Python の -0==0 により
+            # source[:, :, -0:] が全テンソルを返してしまうため, 明示的に空キャッシュを設定する
+            if overlap_source_samples > 0:
+                cache_source = source[:, :, -overlap_source_samples:] if source.shape[2] > overlap_source_samples else source
+            else:
+                cache_source = torch.zeros(1, 1, 0, device=source.device, dtype=source.dtype)
 
             wav_1d = wav_chunk.squeeze(0).detach().cpu()  # (wav_len,)
 

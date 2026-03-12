@@ -52,6 +52,14 @@ class TTSRequest(BaseModel):
     top_p: float = Field(0.95, ge=0.0, le=1.0)
     repetition_penalty: float = Field(1.2, ge=1.0, le=3.0)
     chunk_duration_sec: float = Field(1.0, ge=0.25, le=5.0)
+    crossfade_duration_sec: float = Field(
+        0.04, ge=0.0, le=1.0,
+        description="チャンク境界のクロスフェード秒数（プツプツ音緩和、0で無効）",
+    )
+    mel_overlap: int = Field(
+        10, ge=0,
+        description="HiFiGAN 用 mel フレーム overlap 数（チャンク境界の連続性向上）",
+    )
 
 
 class VoiceInfo(BaseModel):
@@ -334,6 +342,8 @@ def _start_generate_stream(req: TTSRequest, voice_entry: VoiceEntry):
         top_p=req.top_p,
         repetition_penalty=req.repetition_penalty,
         chunk_duration_sec=req.chunk_duration_sec,
+        crossfade_duration_sec=req.crossfade_duration_sec,
+        mel_overlap=req.mel_overlap,
     )
 
 

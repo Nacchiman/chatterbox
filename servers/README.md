@@ -114,6 +114,8 @@ uvicorn tts_server:app --host 0.0.0.0 --port 8880
 | `top_p` | float | No | `0.95` | Top-P (nucleus) サンプリング (0.0 - 1.0) |
 | `repetition_penalty` | float | No | `1.2` | 繰り返しペナルティ (1.0 - 3.0) |
 | `chunk_duration_sec` | float | No | `1.0` | 1 チャンクあたりの目標秒数 (0.25 - 5.0) |
+| `crossfade_duration_sec` | float | No | `0.04` | チャンク境界のクロスフェード秒数（プツプツ音緩和、0–1.0、0で無効） |
+| `mel_overlap` | int | No | `10` | HiFiGAN 用 mel フレーム overlap 数（チャンク境界の連続性向上、>= 0） |
 
 **リクエスト例:**
 
@@ -269,6 +271,8 @@ agent = VoicePipelineAgent(
 | `top_p` | float | `0.95` | Top-P サンプリング |
 | `repetition_penalty` | float | `1.2` | 繰り返しペナルティ |
 | `chunk_duration_sec` | float | `1.0` | サーバー側の 1 チャンクあたりの目標秒数 |
+| `crossfade_duration_sec` | float | `0.04` | チャンク境界のクロスフェード秒数（プツプツ音緩和） |
+| `mel_overlap` | int | `10` | HiFiGAN 用 mel フレーム overlap 数 |
 | `http_timeout` | float | `120.0` | HTTP タイムアウト (秒) |
 | `sample_rate` | int | `24000` | サンプルレート |
 | `num_channels` | int | `1` | チャンネル数 |
