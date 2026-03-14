@@ -182,7 +182,8 @@ def generate_tts_audio(
     exaggeration_input: float = 0.5,
     temperature_input: float = 0.8,
     seed_num_input: int = 0,
-    cfgw_input: float = 0.5
+    cfgw_input: float = 0.5,
+    apply_watermark_input: bool = True,
 ) -> tuple[int, np.ndarray]:
     """
     Generate high-quality speech audio from text using Chatterbox Multilingual model with optional reference audio styling.
@@ -221,6 +222,7 @@ def generate_tts_audio(
         "exaggeration": exaggeration_input,
         "temperature": temperature_input,
         "cfg_weight": cfgw_input,
+        "apply_watermark": apply_watermark_input,
     }
     if chosen_prompt:
         generate_kwargs["audio_prompt_path"] = chosen_prompt
@@ -284,6 +286,7 @@ with gr.Blocks() as demo:
             with gr.Accordion("More options", open=False):
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
                 temp = gr.Slider(0.05, 5, step=.05, label="Temperature", value=.8)
+                apply_watermark = gr.Checkbox(value=True, label="Perth ウォーターマークを付ける")
 
             run_btn = gr.Button("Generate", variant="primary")
 
@@ -310,6 +313,7 @@ with gr.Blocks() as demo:
             temp,
             seed_num,
             cfg_weight,
+            apply_watermark,
         ],
         outputs=[audio_output],
     )

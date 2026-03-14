@@ -90,7 +90,8 @@ def generate(
         top_p,
         top_k,
         repetition_penalty,
-        norm_loudness
+        norm_loudness,
+        apply_watermark,
 ):
     if model is None:
         model = ChatterboxTurboTTS.from_pretrained(DEVICE)
@@ -107,6 +108,7 @@ def generate(
         top_k=int(top_k),
         repetition_penalty=repetition_penalty,
         norm_loudness=norm_loudness,
+        apply_watermark=apply_watermark,
     )
     return (model.sr, wav.squeeze(0).numpy())
 
@@ -159,6 +161,7 @@ with gr.Blocks(title="Chatterbox Turbo", css=CUSTOM_CSS) as demo:
                 repetition_penalty = gr.Slider(1.00, 2.00, step=0.05, label="Repetition Penalty", value=1.2)
                 min_p = gr.Slider(0.00, 1.00, step=0.01, label="Min P (Set to 0 to disable)", value=0.00)
                 norm_loudness = gr.Checkbox(value=True, label="Normalize Loudness (-27 LUFS)")
+                apply_watermark = gr.Checkbox(value=True, label="Perth ウォーターマークを付ける")
 
     demo.load(fn=load_model, inputs=[], outputs=model_state)
 
@@ -175,6 +178,7 @@ with gr.Blocks(title="Chatterbox Turbo", css=CUSTOM_CSS) as demo:
             top_k,
             repetition_penalty,
             norm_loudness,
+            apply_watermark,
         ],
         outputs=audio_output,
     )
