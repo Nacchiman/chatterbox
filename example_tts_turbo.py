@@ -10,5 +10,6 @@ text = "Oh, that's hilarious! [chuckle] Um anyway, we do have a new model in sto
 
 # Generate audio (requires a reference clip for voice cloning)
 # wav = model.generate(text, audio_prompt_path="your_10s_ref_clip.wav")
+# To omit the Perth watermark: wav = model.generate(text, apply_watermark=False)
 wav = model.generate(text)
 ta.save("test-turbo.wav", wav, model.sr)

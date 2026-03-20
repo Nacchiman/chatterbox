@@ -327,6 +327,44 @@ class S3Token2Wav(S3Token2Mel):
         return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
 
     @torch.inference_mode()
+    def flow_inference_streaming(
+        self,
+        speech_tokens,
+        ref_dict: dict,
+        finalize: bool = False,
+        n_cfm_timesteps=None,
+        speech_token_lens=None,
+    ):
+        """ストリーミング用 flow inference。finalize=False で末尾 lookahead 分を除外する。"""
+        n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
+        noise = None
+        if self.meanflow:
+            noise = torch.randn(1, 80, speech_tokens.size(-1) * 2, dtype=self.dtype, device=self.device)
+        output_mels = S3Token2Mel.forward(
+            self,
+            speech_tokens, speech_token_lens=speech_token_lens, ref_wav=None, ref_sr=None,
+            ref_dict=ref_dict, n_cfm_timesteps=n_cfm_timesteps, finalize=finalize, noised_mels=noise,
+        )
+        return output_mels.to(dtype=self.dtype)
+
+    @torch.inference_mode()
+    def hift_inference_streaming(self, speech_feat, cache_source=None):
+        """ストリーミング用 HiFiGAN inference。
+        新規 mel フレームのみをデコードし、cache_source で f0 音源の連続性を保証する。
+
+        Args:
+            speech_feat: mel spectrogram (B, 80, T)
+            cache_source: 前回チャンクの音源信号キャッシュ (B, 1, S) or None
+
+        Returns:
+            generated_speech: wav (B, wav_len)
+            source: 音源信号 (B, 1, wav_len) — 次チャンクのキャッシュ用
+        """
+        if cache_source is None:
+            cache_source = torch.zeros(1, 1, 0, device=self.device, dtype=self.dtype)
+        return self.mel2wav.inference(speech_feat=speech_feat, cache_source=cache_source)
+
+    @torch.inference_mode()
     def inference(
         self,
         speech_tokens,

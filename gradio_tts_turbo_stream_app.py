@@ -12,12 +12,10 @@ EVENT_TAGS = [
 ]
 
 # --- REFINED CSS ---
-# 1. tag-container: Forces the row to wrap items instead of scrolling. Removes borders/backgrounds.
-# 2. tag-btn: Sets the specific look (indigo theme) and stops them from stretching.
 CUSTOM_CSS = """
 .tag-container {
     display: flex !important;
-    flex-wrap: wrap !important; /* This fixes the one-per-line issue */
+    flex-wrap: wrap !important;
     gap: 8px !important;
     margin-top: 5px !important;
     margin-bottom: 10px !important;
@@ -80,18 +78,23 @@ def load_model():
     return model
 
 
-def generate(
+INITIAL_BUFFER_CHUNKS = 3   # 最初の yield 前に蓄積するチャンク数 (~3秒)
+SUBSEQUENT_BUFFER_CHUNKS = 2  # 以降まとめて yield するチャンク数 (~2秒)
+
+
+def generate_streaming(
         model,
         text,
         audio_prompt_path,
         temperature,
         seed_num,
+        exaggeration,
+        cfg_weight,
         min_p,
         top_p,
         top_k,
         repetition_penalty,
-        norm_loudness,
-        apply_watermark,
+        norm_loudness
 ):
     if model is None:
         model = ChatterboxTurboTTS.from_pretrained(DEVICE)
@@ -99,22 +102,44 @@ def generate(
     if seed_num != 0:
         set_seed(int(seed_num))
 
-    wav = model.generate(
+    buffer: list[np.ndarray] = []
+    sample_rate = None
+    initial_sent = False
+
+    for sr, wav_chunk in model.generate_stream(
         text,
         audio_prompt_path=audio_prompt_path,
         temperature=temperature,
+        exaggeration=exaggeration,
+        cfg_weight=cfg_weight,
         min_p=min_p,
         top_p=top_p,
         top_k=int(top_k),
         repetition_penalty=repetition_penalty,
         norm_loudness=norm_loudness,
-        apply_watermark=apply_watermark,
-    )
-    return (model.sr, wav.squeeze(0).numpy())
+    ):
+        sample_rate = sr
+        buffer.append(wav_chunk)
+
+        if not initial_sent:
+            # 最初は INITIAL_BUFFER_CHUNKS 分蓄積してから一括 yield
+            if len(buffer) >= INITIAL_BUFFER_CHUNKS:
+                yield (sample_rate, np.concatenate(buffer))
+                buffer.clear()
+                initial_sent = True
+        else:
+            # 以降は SUBSEQUENT_BUFFER_CHUNKS 分ずつまとめて yield
+            if len(buffer) >= SUBSEQUENT_BUFFER_CHUNKS:
+                yield (sample_rate, np.concatenate(buffer))
+                buffer.clear()
+
+    # 残りのチャンクを flush
+    if buffer and sample_rate is not None:
+        yield (sample_rate, np.concatenate(buffer))
 
 
-with gr.Blocks(title="Chatterbox Turbo", css=CUSTOM_CSS) as demo:
-    gr.Markdown("# ⚡ Chatterbox Turbo")
+with gr.Blocks(title="Chatterbox Turbo Streaming", css=CUSTOM_CSS) as demo:
+    gr.Markdown("# ⚡ Chatterbox Turbo — Streaming")
 
     model_state = gr.State(None)
 
@@ -128,10 +153,8 @@ with gr.Blocks(title="Chatterbox Turbo", css=CUSTOM_CSS) as demo:
             )
 
             # --- Event Tags ---
-            # Switched back to Row, but applied specific CSS to force wrapping
             with gr.Row(elem_classes=["tag-container"]):
                 for tag in EVENT_TAGS:
-                    # elem_classes targets the button specifically
                     btn = gr.Button(tag, elem_classes=["tag-btn"])
 
                     btn.click(
@@ -151,34 +174,36 @@ with gr.Blocks(title="Chatterbox Turbo", css=CUSTOM_CSS) as demo:
             run_btn = gr.Button("Generate ⚡", variant="primary")
 
         with gr.Column():
-            audio_output = gr.Audio(label="Output Audio")
+            audio_output = gr.Audio(label="Output Audio", streaming=True, autoplay=True)
 
             with gr.Accordion("Advanced Options", open=False):
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
                 temp = gr.Slider(0.05, 2.0, step=.05, label="Temperature", value=0.8)
+                exaggeration = gr.Slider(0.0, 2.0, step=0.05, label="Exaggeration", value=0.9)
+                cfg_weight = gr.Slider(0.0, 5.0, step=0.1, label="CFG Weight", value=0.5)
                 top_p = gr.Slider(0.00, 1.00, step=0.01, label="Top P", value=0.95)
                 top_k = gr.Slider(0, 1000, step=10, label="Top K", value=1000)
                 repetition_penalty = gr.Slider(1.00, 2.00, step=0.05, label="Repetition Penalty", value=1.2)
                 min_p = gr.Slider(0.00, 1.00, step=0.01, label="Min P (Set to 0 to disable)", value=0.00)
                 norm_loudness = gr.Checkbox(value=True, label="Normalize Loudness (-27 LUFS)")
-                apply_watermark = gr.Checkbox(value=True, label="Perth ウォーターマークを付ける")
 
     demo.load(fn=load_model, inputs=[], outputs=model_state)
 
     run_btn.click(
-        fn=generate,
+        fn=generate_streaming,
         inputs=[
             model_state,
             text,
             ref_wav,
             temp,
             seed_num,
+            exaggeration,
+            cfg_weight,
             min_p,
             top_p,
             top_k,
             repetition_penalty,
             norm_loudness,
-            apply_watermark,
         ],
         outputs=audio_output,
     )
